@@ -12,9 +12,9 @@ import aiohttp
 MQTT_BROKER = "localhost"
 MQTT_PORT = 1884
 MQTT_TOPIC = "#"
-# Fix: Railway sets PORT=1883 for TCP proxy, so HTTP must NOT use PORT if it equals 1883
-_raw_port = int(os.environ.get("PORT", 8080))
-HTTP_PORT = 8080 if _raw_port == 1883 else _raw_port
+# HTTP port: use HTTP_PORT env var if set, otherwise always 8080 (avoid conflicting with mosquitto on PORT)
+HTTP_PORT = int(os.environ.get("HTTP_PORT", 8080))
+print(f"[HTTP+WS] will listen on port {HTTP_PORT}")
 
 ws_clients = set()
 message_history = []
