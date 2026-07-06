@@ -21,9 +21,19 @@ client.on_connect = on_connect
 print(f'[PC1] Connecting to {BROKER}:{PORT}...')
 client.connect(BROKER, PORT, 60)
 client.loop_start()
-time.sleep(4)
+
+# Wait up to 10 seconds for connection
+for _ in range(20):
+    if connected[0]:
+        break
+    time.sleep(0.5)
 
 print(f'[PC1] connected={connected[0]}')
+if not connected[0]:
+    print('[PC1] ERROR: Could not connect to broker!')
+    client.loop_stop()
+    exit(1)
+
 for i in range(20):
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     msg = f'Hello from VMBusiness PC1! Msg #{i+1} at {ts}'
