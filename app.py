@@ -3,265 +3,249 @@ import json
 import os
 import subprocess
 import time
-from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
+from datetime import datetime
+
 import paho.mqtt.client as mqtt
-import websockets
+from aiohttp import web
+import aiohttp
 
-# Configuration
-MQTT_BROKER = "localhost"
-MQTT_PORT = 1883
-MQTT_TOPIC = "#"  # Subscribe to all topics
-HTTP_PORT = int(os.environ.get("PORT", 8080))
-WS_PORT = 8765
+# ── Configuration ──────────────────────────────────────────────────────────────
+MQTT_BROKER   = "localhost"
+MQTT_PORT     = 1883
+MQTT_TOPIC    = "#"   # subscribe to everything
+HTTP_PORT     = int(os.environ.get("PORT", 8080))
 
-# Store connected WebSocket clients
-ws_clients = set()
-message_history = []  # Keep last 50 messages
+# ── Shared state ───────────────────────────────────────────────────────────────
+ws_clients      = set()          # connected browser WebSocket sessions
+message_history = []             # last 50 MQTT messages
+_loop           = None           # main asyncio event loop (set in main)
 
+# ── Mosquitto ──────────────────────────────────────────────────────────────────
 def start_mosquitto():
-    """Start Mosquitto broker as subprocess"""
-    conf_path = os.path.join(os.path.dirname(__file__), "mosquitto.conf")
-    print(f"[MOSQUITTO] Starting with config: {conf_path}")
+    conf = os.path.join(os.path.dirname(__file__), "mosquitto.conf")
+    print(f"[MOSQUITTO] starting with config: {conf}")
     proc = subprocess.Popen(
-        ["mosquitto", "-c", conf_path],
+        ["mosquitto", "-c", conf],
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT
+        stderr=subprocess.STDOUT,
     )
-    time.sleep(2)  # Wait for broker to start
-    print("[MOSQUITTO] Started")
+    time.sleep(2)
+    print("[MOSQUITTO] broker up")
     return proc
 
-# MQTT client to receive messages and forward to WebSocket
-mqtt_client = mqtt.Client(client_id="dashboard_subscriber")
-
-async def broadcast_message(data):
-    """Send message to all connected WebSocket clients"""
-    if ws_clients:
-        msg = json.dumps(data)
-        await asyncio.gather(
-            *[client.send(msg) for client in list(ws_clients)],
-            return_exceptions=True
-        )
+# ── MQTT subscriber (runs in its own thread via paho loop_start) ───────────────
+async def _broadcast(data: dict):
+    msg = json.dumps(data)
+    dead = set()
+    for ws in list(ws_clients):
+        try:
+            await ws.send_str(msg)
+        except Exception:
+            dead.add(ws)
+    ws_clients.difference_update(dead)
 
 def on_mqtt_message(client, userdata, msg):
-    """Called when MQTT message received - forward to WebSocket clients"""
     data = {
-        "topic": msg.topic,
-        "payload": msg.payload.decode("utf-8", errors="replace"),
+        "topic":     msg.topic,
+        "payload":   msg.payload.decode("utf-8", errors="replace"),
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "qos": msg.qos
+        "qos":       msg.qos,
     }
     message_history.append(data)
     if len(message_history) > 50:
         message_history.pop(0)
     print(f"[MQTT] {data['timestamp']} | {msg.topic}: {data['payload']}")
-    # Schedule async broadcast
-    try:
-        loop = asyncio.get_event_loop()
-        asyncio.run_coroutine_threadsafe(broadcast_message(data), loop)
-    except Exception as e:
-        print(f"[WS BROADCAST ERROR] {e}")
+    if _loop:
+        asyncio.run_coroutine_threadsafe(_broadcast(data), _loop)
 
 def on_mqtt_connect(client, userdata, flags, rc):
     if rc == 0:
-        print("[MQTT CLIENT] Connected to broker")
+        print("[MQTT-CLIENT] connected to broker")
         client.subscribe(MQTT_TOPIC)
-        print(f"[MQTT CLIENT] Subscribed to: {MQTT_TOPIC}")
     else:
-        print(f"[MQTT CLIENT] Connection failed with code {rc}")
+        print(f"[MQTT-CLIENT] connect failed rc={rc}")
 
-async def ws_handler(websocket):
-    """Handle WebSocket connections from browser"""
-    ws_clients.add(websocket)
-    print(f"[WS] Client connected. Total: {len(ws_clients)}")
-    try:
-        # Send message history on connect
-        for msg in message_history:
-            await websocket.send(json.dumps(msg))
-        # Keep alive
-        async for message in websocket:
-            pass
-    except websockets.exceptions.ConnectionClosed:
-        pass
-    finally:
-        ws_clients.discard(websocket)
-        print(f"[WS] Client disconnected. Total: {len(ws_clients)}")
+def start_mqtt_subscriber():
+    c = mqtt.Client(client_id="dashboard_sub")
+    c.on_connect = on_mqtt_connect
+    c.on_message = on_mqtt_message
+    time.sleep(3)  # wait for mosquitto
+    for attempt in range(10):
+        try:
+            c.connect(MQTT_BROKER, MQTT_PORT, 60)
+            c.loop_start()
+            print(f"[MQTT-CLIENT] started (attempt {attempt+1})")
+            return
+        except Exception as e:
+            print(f"[MQTT-CLIENT] attempt {attempt+1} failed: {e}")
+            time.sleep(2)
+    print("[MQTT-CLIENT] gave up connecting")
 
-HTML_CONTENT = """
+# ── Railway-side publisher (Subtask 2, runs as background thread) ──────────────
+def start_railway_publisher():
+    import importlib.util, sys
+    spec = importlib.util.spec_from_file_location(
+        "publisher",
+        os.path.join(os.path.dirname(__file__), "publisher.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.run_publisher()
+
+# ── HTML Dashboard ─────────────────────────────────────────────────────────────
+HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MQTT Dashboard - Railway Test</title>
-    <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 20px; }
-        h1 { color: #38bdf8; margin-bottom: 8px; font-size: 1.8rem; }
-        .subtitle { color: #94a3b8; margin-bottom: 24px; font-size: 0.9rem; }
-        .status-bar { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
-        .status-badge { padding: 6px 14px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
-        .connected { background: #065f46; color: #6ee7b7; }
-        .disconnected { background: #7f1d1d; color: #fca5a5; }
-        .stat { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 12px 18px; }
-        .stat-label { color: #64748b; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; }
-        .stat-value { color: #38bdf8; font-size: 1.5rem; font-weight: bold; }
-        .messages-panel { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 16px; }
-        .messages-header { color: #94a3b8; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; display: flex; justify-content: space-between; }
-        .message-item { background: #0f172a; border-left: 3px solid #38bdf8; padding: 10px 14px; margin-bottom: 8px; border-radius: 0 6px 6px 0; animation: fadeIn 0.3s ease; }
-        .message-item.new { border-left-color: #22c55e; }
-        .message-item.pc { border-left-color: #f59e0b; }
-        .msg-topic { color: #38bdf8; font-size: 0.85rem; font-weight: 600; }
-        .msg-payload { color: #e2e8f0; margin: 4px 0; word-break: break-all; }
-        .msg-meta { color: #475569; font-size: 0.75rem; }
-        .msg-source { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.7rem; margin-left: 6px; }
-        .source-railway { background: #1e40af; color: #93c5fd; }
-        .source-pc { background: #78350f; color: #fcd34d; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: translateX(0); } }
-        .empty-state { text-align: center; color: #475569; padding: 40px; font-size: 0.9rem; }
-        .pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #22c55e; margin-right: 6px; animation: pulse 1.5s infinite; }
-        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MQTT Dashboard - 20260706</title>
+  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;padding:20px}
+    h1{color:#38bdf8;font-size:1.8rem;margin-bottom:6px}
+    .sub{color:#94a3b8;font-size:.85rem;margin-bottom:20px}
+    .bar{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px;align-items:center}
+    .badge{padding:5px 14px;border-radius:20px;font-size:.8rem;font-weight:600}
+    .ok{background:#065f46;color:#6ee7b7}.err{background:#7f1d1d;color:#fca5a5}
+    .stat{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:10px 16px}
+    .sl{color:#64748b;font-size:.7rem;text-transform:uppercase;letter-spacing:1px}
+    .sv{color:#38bdf8;font-size:1.4rem;font-weight:700}
+    .panel{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:16px}
+    .ph{color:#94a3b8;font-size:.8rem;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;display:flex;justify-content:space-between}
+    .item{background:#0f172a;border-left:3px solid #38bdf8;padding:9px 13px;margin-bottom:7px;border-radius:0 6px 6px 0;animation:fi .3s ease}
+    .item.pc{border-left-color:#f59e0b}
+    .tp{color:#38bdf8;font-size:.83rem;font-weight:600}
+    .tp.pc{color:#f59e0b}
+    .pl{margin:4px 0;word-break:break-all}
+    .mt{color:#475569;font-size:.73rem}
+    .src{display:inline-block;padding:1px 8px;border-radius:10px;font-size:.7rem;margin-left:6px}
+    .sr{background:#1e40af;color:#93c5fd}.sp{background:#78350f;color:#fcd34d}
+    @keyframes fi{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:translateX(0)}}
+    .empty{text-align:center;color:#475569;padding:36px;font-size:.9rem}
+    .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:5px;animation:pu 1.5s infinite}
+    @keyframes pu{0%,100%{opacity:1}50%{opacity:.3}}
+    .info-box{background:#1e3a5f;border:1px solid #2563eb;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:.82rem;color:#93c5fd;line-height:1.6}
+    .info-box b{color:#38bdf8}
+  </style>
 </head>
-<body>
-    <div x-data="mqttDashboard()" x-init="init()">
-        <h1>MQTT Dashboard</h1>
-        <p class="subtitle">Railway Server - Real-time MQTT Message Monitor (20260706)</p>
+<body x-data="app()" x-init="init()">
+  <h1>MQTT Dashboard</h1>
+  <p class="sub">Railway Server - Real-time Monitor (20260706) | Topic filter: <b>#</b></p>
 
-        <div class="status-bar">
-            <div :class="wsConnected ? 'status-badge connected' : 'status-badge disconnected'">
-                <span x-show="wsConnected"><span class="pulse"></span>WebSocket Connected</span>
-                <span x-show="!wsConnected">WebSocket Disconnected</span>
-            </div>
-            <div class="stat">
-                <div class="stat-label">Total Messages</div>
-                <div class="stat-value" x-text="messages.length"></div>
-            </div>
-            <div class="stat">
-                <div class="stat-label">From Railway</div>
-                <div class="stat-value" x-text="messages.filter(m => m.topic && m.topic.includes('railway')).length"></div>
-            </div>
-            <div class="stat">
-                <div class="stat-label">From PC</div>
-                <div class="stat-value" x-text="messages.filter(m => m.topic && m.topic.includes('pc')).length"></div>
-            </div>
-        </div>
+  <div class="info-box">
+    <b>Connection Info for PC Publisher:</b><br>
+    MQTT Broker Host: <b id="hostDisplay">loading...</b><br>
+    MQTT TCP Port: <b>1883</b> &nbsp;|&nbsp; WebSocket Port: <b>9001</b><br>
+    Topics: <b>railway/test</b> (Railway publisher) | <b>pc/test</b> (PC publisher)
+  </div>
 
-        <div class="messages-panel">
-            <div class="messages-header">
-                <span>Live Messages (newest first)</span>
-                <span x-text="messages.length + ' messages'"></span>
-            </div>
-            <template x-if="messages.length === 0">
-                <div class="empty-state">Waiting for MQTT messages...<br>Send from Railway publisher or PC client</div>
-            </template>
-            <template x-for="(msg, index) in messages" :key="index">
-                <div :class="'message-item ' + (index === 0 ? 'new' : '') + (msg.topic && msg.topic.includes('pc') ? ' pc' : '')">
-                    <div class="msg-topic">
-                        <span x-text="msg.topic"></span>
-                        <span :class="msg.topic && msg.topic.includes('pc') ? 'msg-source source-pc' : 'msg-source source-railway'">
-                            <span x-text="msg.topic && msg.topic.includes('pc') ? 'PC' : 'Railway'"></span>
-                        </span>
-                    </div>
-                    <div class="msg-payload" x-text="msg.payload"></div>
-                    <div class="msg-meta" x-text="msg.timestamp + ' | QoS: ' + msg.qos"></div>
-                </div>
-            </template>
-        </div>
+  <div class="bar">
+    <div :class="ws ? 'badge ok' : 'badge err'">
+      <span x-show="ws"><span class="dot"></span>WS Connected</span>
+      <span x-show="!ws">WS Disconnected</span>
     </div>
+    <div class="stat"><div class="sl">Total</div><div class="sv" x-text="msgs.length"></div></div>
+    <div class="stat"><div class="sl">From Railway</div><div class="sv" x-text="msgs.filter(m=>m.topic&&m.topic.startsWith('railway')).length"></div></div>
+    <div class="stat"><div class="sl">From PC</div><div class="sv" x-text="msgs.filter(m=>m.topic&&m.topic.startsWith('pc')).length"></div></div>
+  </div>
 
-    <script>
-        function mqttDashboard() {
-            return {
-                messages: [],
-                wsConnected: false,
-                ws: null,
+  <div class="panel">
+    <div class="ph"><span>Live Messages (newest first)</span><span x-text="msgs.length+' msgs'"></span></div>
+    <template x-if="msgs.length===0">
+      <div class="empty">Waiting for MQTT messages...<br>Railway publisher sends every 5s to <b>railway/test</b></div>
+    </template>
+    <template x-for="(m,i) in msgs" :key="i">
+      <div :class="'item '+(m.topic&&m.topic.startsWith('pc')?'pc':'')">
+        <div :class="'tp '+(m.topic&&m.topic.startsWith('pc')?'pc':'')">
+          <span x-text="m.topic"></span>
+          <span :class="m.topic&&m.topic.startsWith('pc')?'src sp':'src sr'" x-text="m.topic&&m.topic.startsWith('pc')?'PC':'Railway'"></span>
+        </div>
+        <div class="pl" x-text="m.payload"></div>
+        <div class="mt" x-text="m.timestamp+' | QoS '+m.qos"></div>
+      </div>
+    </template>
+  </div>
 
-                init() {
-                    this.connectWS();
-                },
-
-                connectWS() {
-                    const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':' + (location.port || (location.protocol === 'https:' ? 443 : 80)) + '/ws';
-                    // For Railway, use same host with /ws path via nginx-like proxy
-                    // Actually connect to WS_PORT or via proxy
-                    const wsHost = location.hostname;
-                    const wsPort = 8765;
-                    const url = 'ws://' + wsHost + ':' + wsPort;
-                    console.log('Connecting to WebSocket:', url);
-                    this.ws = new WebSocket(url);
-                    this.ws.onopen = () => {
-                        this.wsConnected = true;
-                        console.log('WS connected');
-                    };
-                    this.ws.onmessage = (event) => {
-                        const data = JSON.parse(event.data);
-                        this.messages.unshift(data);
-                        if (this.messages.length > 50) this.messages.pop();
-                    };
-                    this.ws.onclose = () => {
-                        this.wsConnected = false;
-                        console.log('WS disconnected, reconnecting in 3s...');
-                        setTimeout(() => this.connectWS(), 3000);
-                    };
-                    this.ws.onerror = (err) => {
-                        console.error('WS error:', err);
-                    };
-                }
-            };
-        }
-    </script>
-</body>
-</html>
+  <script>
+  function app(){
+    return {
+      msgs:[], ws:false, _ws:null,
+      init(){
+        document.getElementById('hostDisplay').textContent = location.hostname;
+        this.connect();
+      },
+      connect(){
+        const url = (location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws';
+        console.log('WS connecting to', url);
+        this._ws = new WebSocket(url);
+        this._ws.onopen  = ()=>{ this.ws=true; };
+        this._ws.onclose = ()=>{ this.ws=false; setTimeout(()=>this.connect(),3000); };
+        this._ws.onerror = e=>console.error('WS err',e);
+        this._ws.onmessage = e=>{
+          const d=JSON.parse(e.data);
+          this.msgs.unshift(d);
+          if(this.msgs.length>50)this.msgs.pop();
+        };
+      }
+    };
+  }
+  </script>
+</body></html>
 """
 
-class DashboardHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html')
-        self.end_headers()
-        self.wfile.write(HTML_CONTENT.encode('utf-8'))
+# ── aiohttp HTTP + WebSocket server (single port) ─────────────────────────────
+async def handle_root(request):
+    return web.Response(text=HTML, content_type="text/html")
 
-    def log_message(self, format, *args):
-        pass  # Suppress logs
+async def handle_ws(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    ws_clients.add(ws)
+    print(f"[WS] client connected  total={len(ws_clients)}")
+    # send history
+    for m in message_history:
+        try:
+            await ws.send_str(json.dumps(m))
+        except Exception:
+            break
+    async for msg in ws:
+        if msg.type == aiohttp.WSMsgType.ERROR:
+            break
+    ws_clients.discard(ws)
+    print(f"[WS] client gone       total={len(ws_clients)}")
+    return ws
 
-def run_http_server():
-    server = HTTPServer(('0.0.0.0', HTTP_PORT), DashboardHandler)
-    print(f"[HTTP] Dashboard running on port {HTTP_PORT}")
-    server.serve_forever()
+async def main():
+    global _loop
+    _loop = asyncio.get_running_loop()
 
-async def run_ws_server():
-    print(f"[WS] WebSocket server running on port {WS_PORT}")
-    async with websockets.serve(ws_handler, "0.0.0.0", WS_PORT):
-        await asyncio.Future()  # Run forever
+    # 1. Start Mosquitto
+    start_mosquitto()
 
-def start_mqtt_client():
-    mqtt_client.on_connect = on_mqtt_connect
-    mqtt_client.on_message = on_mqtt_message
-    time.sleep(2)  # Wait for Mosquitto
-    try:
-        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        mqtt_client.loop_start()
-        print("[MQTT CLIENT] Started")
-    except Exception as e:
-        print(f"[MQTT CLIENT] Failed to connect: {e}")
+    # 2. MQTT subscriber thread
+    threading.Thread(target=start_mqtt_subscriber, daemon=True).start()
 
-if __name__ == '__main__':
-    print("=== MQTT Dashboard Server Starting ===")
+    # 3. Railway publisher thread (Subtask 2)
+    threading.Thread(target=start_railway_publisher, daemon=True).start()
 
-    # Start Mosquitto broker
-    mosquitto_proc = start_mosquitto()
+    # 4. aiohttp app
+    aapp = web.Application()
+    aapp.router.add_get("/",    handle_root)
+    aapp.router.add_get("/ws",  handle_ws)
 
-    # Start MQTT subscriber client in thread
-    mqtt_thread = threading.Thread(target=start_mqtt_client, daemon=True)
-    mqtt_thread.start()
+    runner = web.AppRunner(aapp)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT)
+    await site.start()
+    print(f"[HTTP+WS] listening on port {HTTP_PORT}")
+    print(f"[INFO] Dashboard: http://0.0.0.0:{HTTP_PORT}/")
+    print(f"[INFO] WebSocket: ws://0.0.0.0:{HTTP_PORT}/ws")
 
-    # Start HTTP server in thread
-    http_thread = threading.Thread(target=run_http_server, daemon=True)
-    http_thread.start()
+    await asyncio.Future()  # run forever
 
-    # Run WebSocket server (async)
-    asyncio.run(run_ws_server())
+if __name__ == "__main__":
+    print("=== MQTT Dashboard Server 20260706 ===")
+    asyncio.run(main())
