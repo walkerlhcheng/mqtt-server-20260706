@@ -10,7 +10,7 @@ from aiohttp import web
 import aiohttp
 
 MQTT_BROKER = "localhost"
-MQTT_PORT = 1883
+MQTT_PORT = 1884
 MQTT_TOPIC = "#"
 # Fix: Railway sets PORT=1883 for TCP proxy, so HTTP must NOT use PORT if it equals 1883
 _raw_port = int(os.environ.get("PORT", 8080))
