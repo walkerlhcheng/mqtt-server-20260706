@@ -3,7 +3,7 @@ import time
 from datetime import datetime
 
 BROKER = 'hayabusa.proxy.rlwy.net'
-PORT = 24029
+PORT = 57802
 TOPIC = 'pc/test'
 
 connected = [False]
