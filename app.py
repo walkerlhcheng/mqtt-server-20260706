@@ -12,7 +12,9 @@ import aiohttp
 MQTT_BROKER = "localhost"
 MQTT_PORT = 1883
 MQTT_TOPIC = "#"
-HTTP_PORT = int(os.environ.get("PORT", 8080))
+# Fix: Railway sets PORT=1883 for TCP proxy, so HTTP must NOT use PORT if it equals 1883
+_raw_port = int(os.environ.get("PORT", 8080))
+HTTP_PORT = 8080 if _raw_port == 1883 else _raw_port
 
 ws_clients = set()
 message_history = []
@@ -30,7 +32,11 @@ def start_mosquitto():
         stderr=subprocess.STDOUT,
     )
     time.sleep(2)
-    print("[MOSQUITTO] broker up")
+    if _mosq_proc.poll() is not None:
+        out = _mosq_proc.stdout.read().decode(errors='replace')
+        print(f"[MOSQUITTO] failed to start: {out}")
+    else:
+        print("[MOSQUITTO] broker up")
 
 def watchdog_mosquitto():
     global _mosq_proc
@@ -85,7 +91,7 @@ def on_mqtt_connect(client, userdata, flags, rc):
         print(f"[MQTT-CLIENT] connect failed rc={rc}")
 
 def on_mqtt_disconnect(client, userdata, rc):
-    print(f"[MQTT-CLIENT] disconnected rc={rc}, will auto-reconnect")
+    print(f"[MQTT-CLIENT] disconnected rc={rc}")
 
 def start_mqtt_subscriber():
     global _mqtt_client
@@ -116,13 +122,11 @@ def start_railway_publisher():
     spec.loader.exec_module(mod)
     mod.run_publisher()
 
-HTML = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
+HTML = '''
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MQTT Dashboard 20260706</title>
-<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js" defer></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;padding:20px}
@@ -145,45 +149,38 @@ h1{color:#38bdf8;font-size:1.8rem;margin-bottom:6px}
 .pl{margin:4px 0;word-break:break-all;font-size:.9rem}
 .mt{color:#475569;font-size:.73rem}
 .src{display:inline-block;padding:1px 8px;border-radius:10px;font-size:.7rem;margin-left:6px;font-weight:600}
-.sr{background:#1e40af;color:#93c5fd}
-.sp1{background:#78350f;color:#fcd34d}
-.sp2{background:#4c1d95;color:#d8b4fe}
+.sr{background:#1e40af;color:#93c5fd}.sp1{background:#78350f;color:#fcd34d}.sp2{background:#4c1d95;color:#d8b4fe}
 @keyframes fi{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
 .empty{text-align:center;color:#475569;padding:36px;font-size:.9rem}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:5px;animation:pu 1.5s infinite}
 @keyframes pu{0%,100%{opacity:1}50%{opacity:.3}}
 .info-box{background:#1e3a5f;border:1px solid #2563eb;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:.82rem;color:#93c5fd;line-height:1.8}
 .info-box b{color:#38bdf8}
-</style>
-</head>
+</style></head>
 <body x-data="app()" x-init="init()">
 <h1>MQTT Dashboard</h1>
 <p class="sub">Railway Server - Real-time Monitor (20260706) | Topic: <b>#</b></p>
 <div class="info-box">
-  <b>MQTT TCP Proxy (for external PCs):</b><br>
-  Host: <b>hayabusa.proxy.rlwy.net</b> &nbsp;|&nbsp; Port: <b>24029</b><br>
+  <b>Connection Info for PC Publisher:</b><br>
+  MQTT Broker Host: <b>hayabusa.proxy.rlwy.net</b> | MQTT TCP Port: <b>24029</b><br>
   Topics: <b>railway/test</b> (Railway) | <b>pc/test</b> (PC1/VMBusiness) | <b>pc2/test</b> (PC2/VMNUC)
 </div>
 <div class="bar">
-  <div :class="ws?'badge ok':'badge err'">
-    <span x-show="ws"><span class="dot"></span>WS Connected</span>
-    <span x-show="!ws">WS Disconnected</span>
-  </div>
+  <span class="badge ok" x-show="ws"><span class="dot"></span>WS Connected</span>
+  <span class="badge err" x-show="!ws">WS Disconnected</span>
   <div class="stat"><div class="sl">Total</div><div class="sv" x-text="msgs.length"></div></div>
-  <div class="stat"><div class="sl">Railway</div><div class="sv" x-text="msgs.filter(m=>m.topic&&m.topic.startsWith('railway')).length"></div></div>
-  <div class="stat"><div class="sl">PC1</div><div class="sv" x-text="msgs.filter(m=>m.topic&&m.topic.startsWith('pc/test')).length"></div></div>
-  <div class="stat"><div class="sl">VMNUC</div><div class="sv" x-text="msgs.filter(m=>m.topic&&m.topic.startsWith('pc2/')).length"></div></div>
+  <div class="stat"><div class="sl">From Railway</div><div class="sv" x-text="msgs.filter(m=>m.topic.startsWith('railway')).length"></div></div>
+  <div class="stat"><div class="sl">From PC1</div><div class="sv" x-text="msgs.filter(m=>m.topic==='pc/test').length"></div></div>
+  <div class="stat"><div class="sl">From VMNUC</div><div class="sv" x-text="msgs.filter(m=>m.topic==='pc2/test').length"></div></div>
 </div>
 <div class="panel">
   <div class="ph"><span>Live Messages (newest first)</span><span x-text="msgs.length+' msgs'"></span></div>
-  <template x-if="msgs.length===0">
-    <div class="empty">Waiting for MQTT messages...<br>Railway publisher sends every 5s to <b>railway/test</b></div>
-  </template>
-  <template x-for="(m,i) in msgs" :key="i">
-    <div :class="'item '+(m.topic&&m.topic.startsWith('pc2')?'pc2':(m.topic&&m.topic.startsWith('pc/')?'pc1':''))">
-      <div :class="'tp '+(m.topic&&m.topic.startsWith('pc2')?'pc2':(m.topic&&m.topic.startsWith('pc/')?'pc1':''))">
-        <span x-text="m.topic"></span>
-        <span :class="m.topic&&m.topic.startsWith('pc2')?'src sp2':(m.topic&&m.topic.startsWith('pc/')?'src sp1':'src sr')" x-text="m.topic&&m.topic.startsWith('pc2')?'VMNUC':(m.topic&&m.topic.startsWith('pc/')?'PC1':'Railway')"></span>
+  <template x-if="msgs.length===0"><div class="empty">Waiting for MQTT messages...</div></template>
+  <template x-for="m in msgs" :key="m.timestamp+m.topic">
+    <div :class="'item '+(m.topic==='pc/test'?'pc1':(m.topic==='pc2/test'?'pc2':''))">
+      <div>
+        <span :class="'tp '+(m.topic==='pc/test'?'pc1':(m.topic==='pc2/test'?'pc2':''))" x-text="m.topic"></span>
+        <span :class="'src '+(m.topic==='pc/test'?'sp1':(m.topic==='pc2/test'?'sp2':'sr'))" x-text="m.topic==='pc/test'?'PC1':(m.topic==='pc2/test'?'VMNUC':'Railway')"></span>
       </div>
       <div class="pl" x-text="m.payload"></div>
       <div class="mt" x-text="m.timestamp+' | QoS '+m.qos"></div>
@@ -194,9 +191,7 @@ h1{color:#38bdf8;font-size:1.8rem;margin-bottom:6px}
 function app(){
   return{
     msgs:[],ws:false,_ws:null,
-    init(){
-      this.connect();
-    },
+    init(){ this.connect(); },
     connect(){
       const url=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws';
       this._ws=new WebSocket(url);
@@ -212,8 +207,8 @@ function app(){
   };
 }
 </script>
-</body>
-</html>'''
+</body></html>
+'''
 
 async def handle_root(request):
     return web.Response(text=HTML, content_type="text/html")
@@ -238,6 +233,7 @@ async def handle_ws(request):
 async def main():
     global _loop
     _loop = asyncio.get_running_loop()
+    print(f"[HTTP+WS] will listen on port {HTTP_PORT} (raw PORT env={os.environ.get('PORT','unset')})")
     start_mosquitto()
     threading.Thread(target=watchdog_mosquitto, daemon=True).start()
     threading.Thread(target=start_mqtt_subscriber, daemon=True).start()
