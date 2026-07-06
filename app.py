@@ -10,7 +10,7 @@ from aiohttp import web
 import aiohttp
 
 MQTT_BROKER = "localhost"
-MQTT_PORT = 1884
+MQTT_PORT = 1885
 MQTT_TOPIC = "#"
 # HTTP port: use HTTP_PORT env var if set, otherwise always 8080 (avoid conflicting with mosquitto on PORT)
 HTTP_PORT = int(os.environ.get("HTTP_PORT", 8080))
