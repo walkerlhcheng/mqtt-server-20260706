@@ -16,6 +16,8 @@ MQTT_TOPIC = "#"
 HTTP_PORT = int(os.environ.get("HTTP_PORT", 8080))
 print(f"[HTTP+WS] will listen on port {HTTP_PORT}")
 
+# External TCP proxy port for PC clients (set via MQTT_TCP_PORT env var in Railway)
+MQTT_TCP_PORT = int(os.environ.get("MQTT_TCP_PORT", 57802))
 ws_clients = set()
 message_history = []
 _loop = None
@@ -162,7 +164,7 @@ h1{color:#38bdf8;font-size:1.8rem;margin-bottom:6px}
 <p class="sub">Railway Server - Real-time Monitor (20260706) | Topic: <b>#</b></p>
 <div class="info-box">
   <b>Connection Info for PC Publisher:</b><br>
-  MQTT Broker Host: <b>hayabusa.proxy.rlwy.net</b> | MQTT TCP Port: <b>24029</b><br>
+          MQTT Broker Host: <b>hayabusa.proxy.rlwy.net</b> | MQTT TCP Port: <b>__TCP_PORT__</b><br>
   Topics: <b>railway/test</b> (Railway) | <b>pc/test</b> (PC1/VMBusiness) | <b>pc2/test</b> (PC2/VMNUC)
 </div>
 <div class="bar">
@@ -211,7 +213,7 @@ function app(){
 '''
 
 async def handle_root(request):
-    return web.Response(text=HTML, content_type="text/html")
+        return web.Response(text=HTML.replace('__TCP_PORT__', str(MQTT_TCP_PORT)), content_type="text/html")
 
 async def handle_ws(request):
     ws = web.WebSocketResponse()
