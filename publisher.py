@@ -9,7 +9,7 @@ import os
 from datetime import datetime
 
 MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
-MQTT_PORT = int(os.environ.get("MQTT_PORT",18853))
+MQTT_PORT = int(os.environ.get("MQTT_PORT", 1885))
 TOPIC = "railway/test"
 INTERVAL = int(os.environ.get("PUBLISH_INTERVAL", 5))  # seconds
 
