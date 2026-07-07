@@ -55,3 +55,91 @@ This diagram shows how an MQTT publish message travels from a PC to the broker r
 - The MQTT broker (`amqtt`) runs **inside the Railway container** (`app.py`), bound to internal port `1884`.
 - External clients (PCs) never connect to port `1884` directly — they always go through the Railway TCP Proxy at port `57802`.
 - `publisher.py` (the server-side publisher) connects via the internal loopback port `1885` to avoid going through the proxy.
+
+## Firewall Port Testing (Direct Connection — No TCP Proxy)
+
+This section describes how to test whether MQTT ports are blocked by your local firewall or ISP, by connecting **directly** to the Railway server IP on the standard MQTT ports — bypassing the Railway TCP Proxy.
+
+> **Purpose:** If your PC can reach `hayabusa.proxy.rlwy.net:57802` (Railway proxy) but you want to know whether standard MQTT ports are allowed through your firewall/ISP, run the test script below.
+
+### Ports Tested
+
+| Port | Protocol | Description |
+|------|----------|-------------|
+| 1883 | TCP | Standard unencrypted MQTT |
+| 8883 | TCP | MQTT over TLS/SSL (encrypted) |
+| 9001 | TCP | MQTT over WebSocket |
+
+> **Note:** These ports are tested for TCP reachability only (socket connect). The Railway broker does **not** expose these ports directly — this test purely checks whether your **local network/firewall** allows outbound TCP on each port.
+
+### How the Test Works
+
+```
+[PC / VMBusiness]
+  runs: firewall_port_test_20260707v1.py
+        |
+        |  attempts TCP socket connect on each port
+        v
+[Target: hayabusa.proxy.rlwy.net]   (or any public host)
+  port 1883  --> OPEN = firewall allows standard MQTT outbound
+  port 8883  --> OPEN = firewall allows encrypted MQTT outbound
+  port 9001  --> OPEN = firewall allows MQTT-WS outbound
+        |
+  BLOCKED = your local OS firewall / router / ISP is blocking that port
+```
+
+### Test Script
+
+File: `firewall_port_test_20260707v1.py`  
+Location: `C:\Users\chase\OneDrive\桌面\temp\`
+
+```python
+# firewall_port_test_20260707v1.py
+# Tests outbound TCP reachability on MQTT standard ports
+# WITHOUT using the Railway TCP proxy (port 57802)
+# Purpose: detect which ports are blocked by local firewall or ISP
+
+import socket
+import datetime
+
+HOST = 'hayabusa.proxy.rlwy.net'  # target host (Railway server)
+PORTS = [
+    (1883, 'MQTT unencrypted'),
+    (8883, 'MQTT TLS/SSL'),
+    (9001, 'MQTT WebSocket'),
+]
+TIMEOUT = 5  # seconds
+
+print(f'Firewall Port Test - {datetime.datetime.now()}')
+print(f'Target host: {HOST}')
+print('-' * 50)
+
+for port, desc in PORTS:
+    try:
+        with socket.create_connection((HOST, port), timeout=TIMEOUT) as s:
+            print(f'[OPEN]    Port {port:5d} ({desc}) -- TCP connect SUCCESS')
+    except ConnectionRefusedError:
+        print(f'[CLOSED]  Port {port:5d} ({desc}) -- Connection refused (port closed on server)')
+    except socket.timeout:
+        print(f'[BLOCKED] Port {port:5d} ({desc}) -- Timed out (likely blocked by firewall/ISP)')
+    except Exception as e:
+        print(f'[ERROR]   Port {port:5d} ({desc}) -- {e}')
+
+print('-' * 50)
+print('Done.')
+```
+
+### Interpreting Results
+
+| Result | Meaning |
+|--------|---------|
+| `[OPEN]` | Outbound TCP allowed — port not blocked |
+| `[BLOCKED]` | Timeout — firewall/ISP is silently dropping the packets |
+| `[CLOSED]` | Server refused — firewall passed it but server not listening |
+
+### Run Instructions (VMBusiness PC)
+
+```bash
+cd C:\Users\chase\OneDrive\桌面\temp
+python firewall_port_test_20260707v1.py
+```
