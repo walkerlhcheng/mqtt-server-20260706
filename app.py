@@ -9,7 +9,7 @@ import aiohttp
 
 HTTP_PORT = int(os.environ.get("HTTP_PORT", 8080))
 MQTT_TCP_PORT = int(os.environ.get("MQTT_TCP_PORT", 57802))
-MQTT_INTERNAL_PORT = 1883
+MQTT_INTERNAL_PORT = 1884
 
 ws_clients = set()
 message_history = []
